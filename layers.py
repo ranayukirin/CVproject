@@ -49,3 +49,9 @@ def pixel_wise_softmax(output_map):
 
 def cross_entropy(y_,output_map):
     return -tf.reduce_mean(y_*tf.log(tf.clip_by_value(output_map,1e-10,1.0)), name="cross_entropy")
+
+def blur_predict(blurmap):
+    with tf.name_scope("blur_predict"):
+        threshold = tf.constant(value=0.9, shape=blurmap.shape)
+        predict = tf.cast(tf.greater_equal(blurmap, threshold), tf.float32)
+        return predict

@@ -8,7 +8,7 @@ import util
 from collections import OrderedDict
 from layers import (weight_variable, weight_variable_devonc, bias_variable,
                     conv2d, deconv2d, max_pool, crop_and_concat, pixel_wise_softmax,
-                    cross_entropy)
+                    cross_entropy, blur_predict)
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
@@ -97,9 +97,9 @@ def create_conv_net(x, keep_prob, channels, n_class, layers=3, features_root=16,
             b2 = bias_variable([features // 2], name="b2")
             # Build 2conv model
             conv1 = conv2d(h_deconv_concat, w1, b1, keep_prob)
-            h_conv = tf.nn.relu(conv1)
+            h_conv = tf.nn.leaky_relu(conv1)
             conv2 = conv2d(h_conv, w2, b2, keep_prob)
-            in_node = tf.nn.relu(conv2)
+            in_node = tf.nn.leaky_relu(conv2)
             up_h_convs[layer] = in_node
             # Record
             weights.append((w1, w2))
@@ -112,8 +112,16 @@ def create_conv_net(x, keep_prob, channels, n_class, layers=3, features_root=16,
         weight = weight_variable([1, 1, features_root, n_class], stddev)
         bias = bias_variable([n_class], name="bias")
         conv = conv2d(in_node, weight, bias, tf.constant(1.0))
-        output_map = tf.nn.relu(conv)
+        output_map = tf.nn.leaky_relu(conv)
         up_h_convs["out"] = output_map
+
+    # blur map
+    with tf.name_scope("output_blur"):
+        weight = weight_variable([1, 1, features_root, 1], stddev)
+        bias = bias_variable([1], name="bias")
+        conv = conv2d(in_node, weight, bias, tf.constant(1.0))
+        output_blur = tf.nn.leaky_relu(conv)
+        up_h_convs["blur"] = output_blur
 
     if summaries:
         with tf.name_scope("summaries"):
@@ -140,7 +148,7 @@ def create_conv_net(x, keep_prob, channels, n_class, layers=3, features_root=16,
         variables.append(b1)
         variables.append(b2)
 
-    return output_map, variables, int(in_size - size)
+    return output_map, output_blur, variables, int(in_size - size)
 
 class Unet(object):
     """
@@ -158,11 +166,12 @@ class Unet(object):
 
         self.x = tf.placeholder("float", shape=[None, None, None, channels], name="x")
         self.y = tf.placeholder("float", shape=[None, None, None, n_class], name="y")
+        self.z = tf.placeholder("float", shape=[None, None, None, 1], name="z")
         self.keep_prob = tf.placeholder(tf.float32, name="dropout_probability")  # dropout (keep probability)
 
-        logits, self.variables, self.offset = create_conv_net(self.x, self.keep_prob, channels, n_class, **kwargs)
+        logits, blurmap, self.variables, self.offset = create_conv_net(self.x, self.keep_prob, channels, n_class, **kwargs)
 
-        self.cost = self._get_cost(logits, cost, cost_kwargs)
+        self.cost = self._get_cost(logits, blurmap, cost, cost_kwargs)
 
         self.gradients_node = tf.gradients(self.cost, self.variables)
 
@@ -171,11 +180,16 @@ class Unet(object):
                                                tf.reshape(pixel_wise_softmax(logits), [-1, n_class]))
 
         with tf.name_scope("results"):
+            # Segmentation
             self.predicter = pixel_wise_softmax(logits)
             self.correct_pred = tf.equal(tf.argmax(self.predicter, 3), tf.argmax(self.y, 3))
             self.accuracy = tf.reduce_mean(tf.cast(self.correct_pred, tf.float32))
+            # Blur
+            self.blurpredict = blur_predict(blurmap)
+            self.blur_corr = tf.equal(self.blurpredict, self.z)
+            self.blur_acc = tf.reduce_mean(tf.cast(self.blur_corr, tf.float32))
 
-    def _get_cost(self, logits, cost_name, cost_kwargs):
+    def _get_cost(self, logits, blurmap, cost_name, cost_kwargs):
         """
         Constructs the cost function, either cross_entropy, weighted cross_entropy or dice_coefficient.
         Optional arguments are:
@@ -210,6 +224,8 @@ class Unet(object):
             else:
                 raise ValueError("Unknown cost function: " % cost_name)
 
+            blurloss = tf.losses.mean_squared_error(self.z, blurmap)
+            loss += blurloss
             regularizer = cost_kwargs.pop("regularizer", None)
             if regularizer is not None:
                 regularizers = sum([tf.nn.l2_loss(variable) for variable in self.variables])
@@ -223,6 +239,7 @@ class Unet(object):
         :param model_path: path to the model checkpoint to restore
         :param x_test: Data to predict on. Shape [n, nx, ny, channels]
         :returns prediction: The unet prediction Shape [n, px, py, labels] (px=nx-self.offset/2)
+        :returns blur_predict: The blur place prediction Shape [n, nx, ny, 1]
         """
         init = tf.global_variables_initializer()
         with tf.Session() as sess:
@@ -232,9 +249,11 @@ class Unet(object):
             self.restore(sess, model_path)
 
             y_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], self.n_class))
-            prediction = sess.run(self.predicter, feed_dict={self.x: x_test, self.y: y_dummy, self.keep_prob: 1.})
+            z_dummy = np.empty((x_test.shape[0], x_test.shape[1], x_test.shape[2], 1))
+            prediction, blur_predict = sess.run([self.predicter, self.blurpredict],
+                                                feed_dict={self.x: x_test, self.y: y_dummy, self.z: z_dummy, self.keep_prob: 1.})
 
-        return prediction
+        return prediction, blur_predict
 
     def save(self, sess, model_path):
         """
@@ -311,6 +330,7 @@ class Trainer(object):
         tf.summary.scalar('loss', self.net.cost)
         tf.summary.scalar('cross_entropy', self.net.cross_entropy)
         tf.summary.scalar('accuracy', self.net.accuracy)
+        tf.summary.scalar('blur_acc', self.net.blur_acc)
 
         self.optimizer = self._get_optimizer(training_iters, global_step)
         tf.summary.scalar('learning_rate', self.learning_rate_node)
@@ -369,8 +389,8 @@ class Trainer(object):
                 if ckpt and ckpt.model_checkpoint_path:
                     self.net.restore(sess, ckpt.model_checkpoint_path)
 
-            test_x, test_y = data_provider(self.verification_batch_size)
-            pred_shape = self.store_prediction(sess, test_x, test_y, "_init")
+            test_x, test_y, test_z = data_provider(self.verification_batch_size)
+            pred_shape, blurpred_shape = self.store_prediction(sess, test_x, test_y, test_z, "_init")
 
             summary_writer = tf.summary.FileWriter(output_path, graph=sess.graph)
             logging.info("Start optimization")
@@ -379,13 +399,14 @@ class Trainer(object):
             for epoch in range(epochs):
                 total_loss = 0
                 for step in range((epoch * training_iters), ((epoch + 1) * training_iters)):
-                    batch_x, batch_y = data_provider(self.batch_size)
+                    batch_x, batch_y, batch_z = data_provider(self.batch_size)
 
                     # Run optimization op (backprop)
                     _, loss, lr, gradients = sess.run(
                         (self.optimizer, self.net.cost, self.learning_rate_node, self.net.gradients_node),
                         feed_dict={self.net.x: batch_x,
                                    self.net.y: util.crop_to_shape(batch_y, pred_shape),
+                                   self.net.z: batch_z,
                                    self.net.keep_prob: dropout})
 
                     if self.net.summaries and self.norm_grads:
@@ -395,26 +416,29 @@ class Trainer(object):
 
                     if step % display_step == 0:
                         self.output_minibatch_stats(sess, summary_writer, step, batch_x,
-                                                    util.crop_to_shape(batch_y, pred_shape))
+                                                    util.crop_to_shape(batch_y, pred_shape), batch_z)
 
                     total_loss += loss
 
                 self.output_epoch_stats(epoch, total_loss, training_iters, lr)
-                self.store_prediction(sess, test_x, test_y, "epoch_%s" % epoch)
+                self.store_prediction(sess, test_x, test_y, test_z, "epoch_%s" % epoch)
 
                 save_path = self.net.save(sess, save_path)
             logging.info("Optimization Finished!")
 
             return save_path
 
-    def store_prediction(self, sess, batch_x, batch_y, name):
-        prediction = sess.run(self.net.predicter, feed_dict={self.net.x: batch_x,
-                                                             self.net.y: batch_y,
-                                                             self.net.keep_prob: 1.})
+    def store_prediction(self, sess, batch_x, batch_y, batch_z,  name):
+        prediction, blurpredict = sess.run([self.net.predicter, self.net.blurpredict], feed_dict={self.net.x: batch_x,
+                                                                                                  self.net.y: batch_y,
+                                                                                                  self.net.z: batch_z,
+                                                                                                  self.net.keep_prob: 1.})
         pred_shape = prediction.shape
+        blurpred_shape = blurpredict.shape
 
         loss = sess.run(self.net.cost, feed_dict={self.net.x: batch_x,
                                                   self.net.y: util.crop_to_shape(batch_y, pred_shape),
+                                                  self.net.z: batch_z,
                                                   self.net.keep_prob: 1.})
 
         logging.info("Verification error= {:.1f}%, loss= {:.4f}".format(error_rate(prediction,
@@ -425,28 +449,32 @@ class Trainer(object):
         img = util.combine_img_prediction(batch_x, batch_y, prediction)
         util.save_image(img, "%s/%s.jpg" % (self.prediction_path, name))
 
-        return pred_shape
+        return pred_shape, blurpred_shape
 
     def output_epoch_stats(self, epoch, total_loss, training_iters, lr):
         logging.info(
             "Epoch {:}, Average loss: {:.4f}, learning rate: {:.4f}".format(epoch, (total_loss / training_iters), lr))
 
-    def output_minibatch_stats(self, sess, summary_writer, step, batch_x, batch_y):
+    def output_minibatch_stats(self, sess, summary_writer, step, batch_x, batch_y, batch_z):
         # Calculate batch loss and accuracy
-        summary_str, loss, acc, predictions = sess.run([self.summary_op,
-                                                        self.net.cost,
-                                                        self.net.accuracy,
-                                                        self.net.predicter],
-                                                       feed_dict={self.net.x: batch_x,
-                                                                  self.net.y: batch_y,
-                                                                  self.net.keep_prob: 1.})
+        summary_str, loss, acc, predictions, blurpredict, bluracc = sess.run([self.summary_op,
+                                                                              self.net.cost,
+                                                                              self.net.accuracy,
+                                                                              self.net.predicter,
+                                                                              self.net.blurpredict,
+                                                                              self.net.blur_acc],
+                                                                              feed_dict={self.net.x: batch_x,
+                                                                                         self.net.y: batch_y,
+                                                                                         self.net.z: batch_z,
+                                                                                         self.net.keep_prob: 1.})
         summary_writer.add_summary(summary_str, step)
         summary_writer.flush()
         logging.info(
-            "Iter {:}, Minibatch Loss= {:.4f}, Training Accuracy= {:.4f}, Minibatch error= {:.1f}%".format(step,
-                                                                                                           loss,
-                                                                                                           acc,
-                                                                                                           error_rate(predictions, batch_y)))
+            "Iter {:}, Minibatch Loss= {:.4f}, Training Accuracy= {:.4f}, Blur Acc= {:.4f}, Minibatch error= {:.1f}%".format(step,
+                                                                                                                             loss,
+                                                                                                                             acc,
+                                                                                                                             bluracc,
+                                                                                                                             error_rate(predictions, batch_y)))
 
 
 def _update_avg_gradients(avg_gradients, gradients, step):
